@@ -1,0 +1,11 @@
+# Downloaded Binance data and outputs
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets (for when we add the live bot)
+.env
+*.key
