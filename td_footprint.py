@@ -119,6 +119,7 @@ def merge_zones(hit, row_size, tf_min, window=6):
     out = []
     for r in hit.sort_values("candle").to_dict("records"):
         r["n"] = 1
+        merged = False
         for o in reversed(out):
             if r["candle"] - o["candle"] > window * tf_ms:
                 break
@@ -131,8 +132,9 @@ def merge_zones(hit, row_size, tf_min, window=6):
                 o["ratio"] = max(o["ratio"], r["ratio"])
                 o["poc_vol"] = max(o["poc_vol"], r["poc_vol"])
                 o["n"] += 1
+                merged = True
                 break
-        else:
+        if not merged:
             out.append(r)
     return pd.DataFrame(out)
 
