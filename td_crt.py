@@ -61,7 +61,7 @@ def swing_levels(H, L):
     return pd.Series(sh).ffill().to_numpy(), pd.Series(sl).ffill().to_numpy()
 
 
-def simulate(d, fill, stop, target, k0, t_end_idx, O5, H5, L5, C5, P):
+def simulate(d, fill, stop, target, k0, t_end_idx, O5, H5, L5, C5, P, fee_in):
     """Walk 5m candles from k0 to t_end_idx. Returns (R, reason, k_exit, exit_px)."""
     sd = d * (fill - stop)
     exit_px, reason, k_x = C5[t_end_idx], "timeout", t_end_idx
@@ -75,69 +75,137 @@ def simulate(d, fill, stop, target, k0, t_end_idx, O5, H5, L5, C5, P):
             break
     x_eff = exit_px if reason == "target" else exit_px * (1 - d * P.slip)
     fee_out = P.feemaker if reason == "target" else P.feetaker
-    r = (d * (x_eff - fill) - P.feetaker * fill - fee_out * x_eff) / sd
+    r = (d * (x_eff - fill) - fee_in * fill - fee_out * x_eff) / sd
     return r, reason, k_x, exit_px
 
 
+def build_setups(htf, hms, model, life):
+    """model 'every': candle 1 = the previous candle (every candle is a range).
+       model 'chain': a range candle stays active until a later candle sweeps ONE side and closes back
+       inside; that sweep candle becomes the next range. Candles inside the range change nothing; a
+       breakout / two-sided candle / age > life replaces the reference without a signal."""
+    TH = htf["candle"].to_numpy()
+    H, L, C = (htf[c].to_numpy() for c in ["high", "low", "close"])
+    out, gaps = [], 0
+    if model == "every":
+        for i in range(len(htf) - 2):
+            if TH[i + 1] - TH[i] != hms or TH[i + 2] - TH[i + 1] != hms:
+                gaps += 1
+                continue
+            out.append(dict(i2=i + 1, crh=H[i], crl=L[i], up=H[i + 1] > H[i], dn=L[i + 1] < L[i]))
+        return out, gaps
+    rh = rl = None
+    age, prev = 0, None
+    for j in range(len(htf)):
+        if prev is not None and TH[j] - prev != hms:
+            rh = None
+            gaps += 1
+        prev = TH[j]
+        h, l, c = H[j], L[j], C[j]
+        if rh is None:
+            rh, rl, age = h, l, 0
+            continue
+        age += 1
+        bu = l < rl and h <= rh and rl < c <= rh
+        be = h > rh and l >= rl and rh > c >= rl
+        if bu or be:
+            out.append(dict(i2=j, crh=rh, crl=rl, up=be, dn=bu))
+            rh, rl, age = h, l, 0
+        elif (h > rh and l < rl) or c > rh or c < rl or age > life:
+            rh, rl, age = h, l, 0
+    return out, gaps
+
+
 def run(P):
+    if P.model == "chain" and P.entry == "mss":
+        raise SystemExit("--entry mss needs --model every (the chain rule uses candle 2's close)")
     cd5 = pd.read_csv(DATA / f"{P.symbol}_5m_candles.csv").sort_values("candle").reset_index(drop=True)
     htf_s, ltf_s = P.pair.split("/")
     hms, lms, off = MS[htf_s], MS[ltf_s], int(P.hoffset * 3_600_000)
     htf = resample(cd5, hms, off)
     ltf = resample(cd5, lms, 0) if lms > MS["5m"] else cd5[["candle", "open", "high", "low", "close"]]
     T5 = cd5["candle"].to_numpy()
+    n5 = len(T5)
     O5, H5, L5, C5 = (cd5[c].to_numpy() for c in ["open", "high", "low", "close"])
     TL = ltf["candle"].to_numpy()
     HL, LL, CL = (ltf[c].to_numpy() for c in ["high", "low", "close"])
     SH, SL = swing_levels(HL, LL)
     TH = htf["candle"].to_numpy()
-    skips = dict(not_consecutive=0, no_sweep=0, both_sides=0, no_trigger=0, rr_below_min=0, busy=0, no_swing=0)
+    H2, L2, C2 = (htf[c].to_numpy() for c in ["high", "low", "close"])
+    setups, gaps = build_setups(htf, hms, P.model, P.life)
+    skips = dict(gaps=gaps, no_sweep=0, both_sides=0, no_trigger=0, rr_below_min=0, no_fill=0, busy=0, no_swing=0)
     out, free_at, cands = [], -1, 0
-    for i in range(len(htf) - 2):
-        t2 = TH[i + 1]
-        if TH[i + 1] - TH[i] != hms or TH[i + 2] - TH[i + 1] != hms:
-            skips["not_consecutive"] += 1
-            continue
-        crh, crl = htf["high"].iloc[i], htf["low"].iloc[i]
-        h2, l2, c2 = htf["high"].iloc[i + 1], htf["low"].iloc[i + 1], htf["close"].iloc[i + 1]
-        t_end = t2 + 2 * hms                                   # end of candle 3
-        t_end_idx = int(np.searchsorted(T5, t_end, "left")) - 1
-        up, dn = h2 > crh, l2 < crl
-        if not (up or dn):
+    for s in setups:
+        i2, crh, crl = s["i2"], s["crh"], s["crl"]
+        t2, h2, l2, c2 = TH[i2], H2[i2], L2[i2], C2[i2]
+        if not (s["up"] or s["dn"]):
             skips["no_sweep"] += 1
             continue
-        if up and dn:
+        if s["up"] and s["dn"]:
             skips["both_sides"] += 1
             continue
-        d = 1 if dn else -1                                    # low swept -> long; high swept -> short
-        if P.entry == "close":
+        d = 1 if s["dn"] else -1                               # low swept -> long; high swept -> short
+        tgt = (crh if d == 1 else crl) if P.target == "opposite" else (crh + crl) / 2
+        n_after = P.hold if P.entry == "retest" else 1
+        t_end = t2 + (1 + n_after) * hms
+        t_end_idx = int(np.searchsorted(T5, t_end, "left")) - 1
+        fee_in = P.feetaker
+        if P.entry == "retest":
+            if not (crl <= c2 <= crh):
+                skips["no_sweep"] += 1
+                continue
+            cands += 1
+            level = crl if d == 1 else crh
+            stop = l2 if d == 1 else h2
+            sd0 = d * (level - stop)
+            if sd0 <= 0 or d * (tgt - level) / sd0 < P.minrr:
+                skips["rr_below_min"] += 1
+                continue
+            k_s = int(np.searchsorted(T5, t2 + hms, "left"))
+            k_v = min(int(np.searchsorted(T5, t2 + (1 + P.valid) * hms, "left")) - 1, n5 - 1)
+            k0 = None
+            for k in range(k_s, k_v + 1):
+                touch = (L5[k] <= level) if d == 1 else (H5[k] >= level)
+                reached = (H5[k] >= tgt) if d == 1 else (L5[k] <= tgt)
+                if touch:
+                    k0 = k
+                    break
+                if reached:
+                    break                                       # move happened without us: order cancelled
+            if k0 is None or k0 > t_end_idx:
+                skips["no_fill"] += 1
+                continue
+            fill = min(O5[k0], level) if d == 1 else max(O5[k0], level)
+            target = tgt
+            fee_in = P.feemaker                                 # limit entry: maker, no slippage
+        elif P.entry == "close":
             if not (crl <= c2 <= crh):
                 skips["no_sweep"] += 1                         # broke out and stayed out = not CRT
                 continue
             cands += 1
-            t_in = t2 + hms
-            k0 = int(np.searchsorted(T5, t_in, "left"))
+            k0 = int(np.searchsorted(T5, t2 + hms, "left"))
             if k0 > t_end_idx:
                 continue
-            raw = C5[k0 - 1]
             stop = l2 if d == 1 else h2
+            fill = C5[k0 - 1] * (1 + d * P.slip)
+            target = tgt
         else:
             a = int(np.searchsorted(TL, t2, "left"))
             b = int(np.searchsorted(TL, t2 + hms, "left"))
-            s = None
+            sw = None
             for m in range(a, b):
                 if (LL[m] < crl) if d == 1 else (HL[m] > crh):
-                    s = m
+                    sw = m
                     break
-            if s is None:
+            if sw is None:
                 continue
             cands += 1
-            ref = SH[s] if d == 1 else SL[s]
+            ref = SH[sw] if d == 1 else SL[sw]
             if np.isnan(ref):
                 skips["no_swing"] += 1
                 continue
-            ext, trig = (LL[s] if d == 1 else HL[s]), None
-            for m in range(s, b):
+            ext, trig = (LL[sw] if d == 1 else HL[sw]), None
+            for m in range(sw, b):
                 ext = min(ext, LL[m]) if d == 1 else max(ext, HL[m])
                 if (HL[m] > crh) if d == 1 else (LL[m] < crl):
                     break                                       # other side taken first: invalid
@@ -148,13 +216,12 @@ def run(P):
             if trig is None:
                 skips["no_trigger"] += 1
                 continue
-            t_in = TL[trig] + lms
-            k0 = int(np.searchsorted(T5, t_in, "left"))
+            k0 = int(np.searchsorted(T5, TL[trig] + lms, "left"))
             if k0 > t_end_idx:
                 continue
-            raw, stop = CL[trig], ext
-        fill = raw * (1 + d * P.slip)
-        target = (crh if d == 1 else crl) if P.target == "opposite" else (crh + crl) / 2
+            stop = ext
+            fill = CL[trig] * (1 + d * P.slip)
+            target = tgt
         sd = d * (fill - stop)
         if sd <= 0 or d * (target - fill) <= 0 or d * (target - fill) / sd < P.minrr:
             skips["rr_below_min"] += 1
@@ -162,7 +229,7 @@ def run(P):
         if T5[k0] <= free_at:
             skips["busy"] += 1
             continue
-        r, reason, k_x, xp = simulate(d, fill, stop, target, k0, t_end_idx, O5, H5, L5, C5, P)
+        r, reason, k_x, xp = simulate(d, fill, stop, target, k0, t_end_idx, O5, H5, L5, C5, P, fee_in)
         free_at = T5[k_x] + MS["5m"] - 1
         out.append(dict(entry_time=pd.to_datetime(T5[k0], unit="ms"), exit_time=pd.to_datetime(T5[k_x], unit="ms"),
                         dir=d, entry=fill, stop=stop, target=target, exit=xp, reason=reason,
@@ -208,7 +275,11 @@ def main():
     ap.add_argument("cmd", choices=["run"])
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--pair", default="4h/15m", choices=["4h/15m", "1h/5m", "1d/1h"])
-    ap.add_argument("--entry", default="mss", choices=["mss", "close"])
+    ap.add_argument("--entry", default="retest", choices=["retest", "mss", "close"])
+    ap.add_argument("--model", default="chain", choices=["chain", "every"])
+    ap.add_argument("--life", type=int, default=30, help="chain: max HTF candles a range stays active")
+    ap.add_argument("--valid", type=int, default=2, help="retest: HTF candles the limit order stays live after the sweep")
+    ap.add_argument("--hold", type=int, default=6, help="retest: max HTF candles to hold after the sweep candle")
     ap.add_argument("--target", default="opposite", choices=["opposite", "mid"])
     ap.add_argument("--minrr", type=float, default=1.0)
     ap.add_argument("--hoffset", type=float, default=0.0, help="shift HTF bins by hours (UTC)")
@@ -219,14 +290,14 @@ def main():
     ap.add_argument("--out", default=None)
     P = ap.parse_args()
     tr, skips, cands, nh = run(P)
-    print(f"CRT {P.pair}, entry {P.entry}, target {P.target}, minrr {P.minrr}; {nh} HTF candles, {cands} CRT candidates")
+    print(f"CRT {P.pair}, model {P.model}, entry {P.entry}, target {P.target}, minrr {P.minrr}; {nh} HTF candles, {cands} CRT candidates")
     print("Skipped:", skips)
     if tr.empty:
         print("No trades.")
         return
     summarize(tr)
     verdict(tr, P.split)
-    name = P.out or f"crt_{P.pair.replace('/', '_')}_{P.entry}_{P.target}"
+    name = P.out or f"crt_{P.pair.replace('/', '_')}_{P.model}_{P.entry}_{P.target}"
     tr.to_csv(DATA / f"{P.symbol}_{name}_trades.csv", index=False)
 
 
